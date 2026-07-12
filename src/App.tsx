@@ -5,7 +5,7 @@ import {
   FILAMENTS,
   matchFilamentType,
 } from './lib/filaments';
-import { parseProjectFile, ProjectInfo } from './lib/threemf';
+import { DEFAULT_LIMITS, parseProjectFile, ProjectInfo } from './lib/threemf';
 import { voxelize } from './lib/voxelize';
 import { computePartMetrics, PartMetrics, SimulationSettings } from './lib/simulation';
 import {
@@ -77,6 +77,15 @@ export default function App() {
 
   const onFile = useCallback(
     (file: File) => {
+      // Reject oversized uploads before reading them into memory.
+      if (file.size > DEFAULT_LIMITS.maxFileBytes) {
+        setProject(null);
+        setError(
+          `File is too large (${Math.ceil(file.size / (1024 * 1024))} MB); limit is ` +
+            `${Math.ceil(DEFAULT_LIMITS.maxFileBytes / (1024 * 1024))} MB.`,
+        );
+        return;
+      }
       file.arrayBuffer().then((buf) => loadBuffer(buf, file.name));
     },
     [loadBuffer],

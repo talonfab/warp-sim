@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Application + dev-tooling dependencies (npm).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Collapse routine bumps into a couple of PRs to cut review noise; security
+    # fixes still come through individually and promptly.
+    groups:
+      production-dependencies:
+        dependency-type: "production"
+        update-types:
+          - "minor"
+          - "patch"
+      dev-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep any GitHub Actions workflows current (no-op until workflows are added).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

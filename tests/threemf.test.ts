@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from 'vitest';
 import { zipSync, strToU8 } from 'fflate';
-import { parse3MF, parseSTL } from '../src/lib/threemf';
+import { DEFAULT_LIMITS, parse3MF, parseSTL, type ParseLimits } from '../src/lib/threemf';
 import { computeBBox } from '../src/lib/geometry';
 
 const CUBE_MESH_XML = `
@@ -225,5 +225,43 @@ describe('parseSTL', () => {
     const box = computeBBox(mesh);
     expect(box.max[0] - box.min[0]).toBeCloseTo(5);
     expect(box.max[1] - box.min[1]).toBeCloseTo(5);
+  });
+});
+
+describe('hostile-input hardening', () => {
+  const limits = (o: Partial<ParseLimits>): ParseLimits => ({ ...DEFAULT_LIMITS, ...o });
+  const cubeModel = `<?xml version="1.0"?>
+    <model unit="millimeter" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+      <resources><object id="1" type="model">${CUBE_MESH_XML}</object></resources>
+      <build><item objectid="1"/></build>
+    </model>`;
+
+  it('rejects an oversized upload before decompressing', () => {
+    const buf = zip({ '3D/3dmodel.model': cubeModel });
+    expect(() => parse3MF(buf, 'big.3mf', limits({ maxFileBytes: 10 }))).toThrow(/too large/i);
+  });
+
+  it('rejects a mesh over the triangle cap', () => {
+    const buf = zip({ '3D/3dmodel.model': cubeModel }); // the cube has 12 triangles
+    expect(() => parse3MF(buf, 'dense.3mf', limits({ maxTriangles: 6 }))).toThrow(/too many triangles/i);
+  });
+
+  it('rejects a mesh over the vertex cap', () => {
+    const buf = zip({ '3D/3dmodel.model': cubeModel }); // the cube has 8 vertices
+    expect(() => parse3MF(buf, 'dense.3mf', limits({ maxVertices: 4 }))).toThrow(/too many vertices/i);
+  });
+
+  it('rejects a zip entry that decompresses past the per-entry cap (zip-bomb guard)', () => {
+    const buf = zip({ '3D/3dmodel.model': cubeModel });
+    // The model XML is a few hundred bytes uncompressed; a tiny cap trips it
+    // from the archive directory, before the entry is inflated into memory.
+    expect(() => parse3MF(buf, 'bomb.3mf', limits({ maxEntryBytes: 50 }))).toThrow(/decompress|zip bomb/i);
+  });
+
+  it('rejects a binary STL claiming too many triangles', () => {
+    const nTri = 3;
+    const buf = new ArrayBuffer(84 + nTri * 50);
+    new DataView(buf).setUint32(80, nTri, true);
+    expect(() => parseSTL(buf, 'many.stl', limits({ maxTriangles: 1 }))).toThrow(/too many triangles/i);
   });
 });

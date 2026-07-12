@@ -61,6 +61,38 @@ export interface ProjectInfo {
   fileName: string;
 }
 
+/**
+ * Resource limits for parsing untrusted uploads. This tool runs entirely in
+ * the visitor's browser, so the worst a hostile file can do is hang or OOM
+ * their own tab — but that's still a bad experience, so we cap input up front
+ * and fail with a clear message instead of freezing. Limits are generous
+ * relative to real printable models (tens of MB, well under a million
+ * triangles) and only bite pathological or malicious input.
+ */
+export interface ParseLimits {
+  /** Max raw upload size (compressed, on disk), bytes. */
+  maxFileBytes: number;
+  /** Max total decompressed size across the archive entries we read, bytes. */
+  maxUnzippedBytes: number;
+  /** Max decompressed size of any single archive entry, bytes. */
+  maxEntryBytes: number;
+  /** Max triangles in one mesh. */
+  maxTriangles: number;
+  /** Max vertices in one mesh. */
+  maxVertices: number;
+}
+
+const MB = 1024 * 1024;
+export const DEFAULT_LIMITS: ParseLimits = {
+  maxFileBytes: 150 * MB,
+  maxUnzippedBytes: 400 * MB,
+  maxEntryBytes: 300 * MB,
+  maxTriangles: 5_000_000,
+  maxVertices: 5_000_000,
+};
+
+const mb = (bytes: number) => Math.ceil(bytes / MB);
+
 interface ParsedObject {
   mesh?: Mesh;
   components?: Array<{ objectId: string; path?: string; transform: Transform3MF }>;
@@ -75,9 +107,21 @@ function parseXml(text: string): Document {
   return doc;
 }
 
-function parseMeshElement(meshEl: Element): Mesh {
+function parseMeshElement(meshEl: Element, limits: ParseLimits): Mesh {
   const vertexEls = meshEl.getElementsByTagName('vertex');
   const triEls = meshEl.getElementsByTagName('triangle');
+  if (vertexEls.length > limits.maxVertices) {
+    throw new Error(
+      `Mesh has too many vertices (${vertexEls.length.toLocaleString()}); limit is ` +
+        `${limits.maxVertices.toLocaleString()}.`,
+    );
+  }
+  if (triEls.length > limits.maxTriangles) {
+    throw new Error(
+      `Mesh has too many triangles (${triEls.length.toLocaleString()}); limit is ` +
+        `${limits.maxTriangles.toLocaleString()}.`,
+    );
+  }
   const vertices = new Float32Array(vertexEls.length * 3);
   for (let i = 0; i < vertexEls.length; i++) {
     const v = vertexEls[i];
@@ -111,6 +155,7 @@ function loadModelFile(
   files: Record<string, Uint8Array>,
   path: string,
   store: ObjectStore,
+  limits: ParseLimits,
 ): Document {
   const data = files[path];
   if (!data) throw new Error(`3MF is missing model file: ${path}`);
@@ -122,7 +167,7 @@ function loadModelFile(
     if (!id) continue;
     const parsed: ParsedObject = {};
     const meshEl = obj.getElementsByTagName('mesh')[0];
-    if (meshEl) parsed.mesh = parseMeshElement(meshEl);
+    if (meshEl) parsed.mesh = parseMeshElement(meshEl, limits);
     const compEls = obj.getElementsByTagName('component');
     if (compEls.length > 0) {
       parsed.components = [];
@@ -154,11 +199,12 @@ function resolveObjectMesh(
   id: string,
   transform: Transform3MF,
   out: Mesh[],
+  limits: ParseLimits,
   depth = 0,
 ): void {
   if (depth > 16) throw new Error('3MF component nesting too deep (cycle?)');
   const key = `${path}#${id}`;
-  if (!store.has(key)) loadModelFile(files, path, store);
+  if (!store.has(key)) loadModelFile(files, path, store, limits);
   const obj = store.get(key);
   if (!obj) throw new Error(`3MF references missing object id=${id} in ${path}`);
   if (obj.mesh && obj.mesh.indices.length > 0) {
@@ -174,6 +220,7 @@ function resolveObjectMesh(
         comp.objectId,
         composeTransforms(transform, comp.transform),
         out,
+        limits,
         depth + 1,
       );
     }
@@ -392,11 +439,44 @@ function splitDistantGroups(meshes: Mesh[]): Mesh[][] {
   return result.map((group) => group.map((i) => meshes[i]));
 }
 
-export function parse3MF(buffer: ArrayBuffer, fileName: string): ProjectInfo {
-  const files = unzipSync(new Uint8Array(buffer));
+export function parse3MF(
+  buffer: ArrayBuffer,
+  fileName: string,
+  limits: ParseLimits = DEFAULT_LIMITS,
+): ProjectInfo {
+  if (buffer.byteLength > limits.maxFileBytes) {
+    throw new Error(
+      `File is too large (${mb(buffer.byteLength)} MB); limit is ${mb(limits.maxFileBytes)} MB.`,
+    );
+  }
+  // Decompress only the entries we actually read (model/config/rels), and cap
+  // both per-entry and total decompressed size to defuse zip bombs. Sizes come
+  // from the archive's directory, so an oversized entry is rejected before we
+  // spend memory on it. (A crafted header could understate its size; the total
+  // cap still bounds the damage.)
+  let totalUnzipped = 0;
+  const files = unzipSync(new Uint8Array(buffer), {
+    filter: (file) => {
+      if (!/\.(model|config|rels)$/i.test(file.name)) return false;
+      if (file.originalSize > limits.maxEntryBytes) {
+        throw new Error(
+          `3MF entry "${file.name}" decompresses to ${mb(file.originalSize)} MB; ` +
+            `limit is ${mb(limits.maxEntryBytes)} MB.`,
+        );
+      }
+      totalUnzipped += file.originalSize;
+      if (totalUnzipped > limits.maxUnzippedBytes) {
+        throw new Error(
+          `3MF decompresses to more than ${mb(limits.maxUnzippedBytes)} MB ` +
+            '(possible zip bomb) — refusing to load.',
+        );
+      }
+      return true;
+    },
+  });
   const rootPath = findRootModelPath(files);
   const store: ObjectStore = new Map();
-  const rootDoc = loadModelFile(files, rootPath, store);
+  const rootDoc = loadModelFile(files, rootPath, store, limits);
 
   const modelEl = rootDoc.getElementsByTagName('model')[0];
   const unit = modelEl?.getAttribute('unit') ?? 'millimeter';
@@ -431,6 +511,7 @@ export function parse3MF(buffer: ArrayBuffer, fileName: string): ProjectInfo {
       objectId,
       parseTransformAttr(item.getAttribute('transform')),
       parts,
+      limits,
     );
     if (parts.length === 0) continue;
     const plateId = queues.get(objectId)?.shift();
@@ -506,7 +587,16 @@ export function parse3MF(buffer: ArrayBuffer, fileName: string): ProjectInfo {
 }
 
 /** Binary + ASCII STL fallback so users can drop plain models too. */
-export function parseSTL(buffer: ArrayBuffer, fileName: string): ProjectInfo {
+export function parseSTL(
+  buffer: ArrayBuffer,
+  fileName: string,
+  limits: ParseLimits = DEFAULT_LIMITS,
+): ProjectInfo {
+  if (buffer.byteLength > limits.maxFileBytes) {
+    throw new Error(
+      `File is too large (${mb(buffer.byteLength)} MB); limit is ${mb(limits.maxFileBytes)} MB.`,
+    );
+  }
   const view = new DataView(buffer);
   const isBinary = (() => {
     if (buffer.byteLength < 84) return false;
@@ -517,6 +607,12 @@ export function parseSTL(buffer: ArrayBuffer, fileName: string): ProjectInfo {
   let vertices: Float32Array;
   if (isBinary) {
     const nTri = view.getUint32(80, true);
+    if (nTri > limits.maxTriangles) {
+      throw new Error(
+        `STL has too many triangles (${nTri.toLocaleString()}); limit is ` +
+          `${limits.maxTriangles.toLocaleString()}.`,
+      );
+    }
     vertices = new Float32Array(nTri * 9);
     for (let t = 0; t < nTri; t++) {
       const base = 84 + t * 50 + 12; // skip normal
@@ -535,6 +631,12 @@ export function parseSTL(buffer: ArrayBuffer, fileName: string): ProjectInfo {
     vertices = new Float32Array(coords);
   }
   if (vertices.length < 9) throw new Error('STL contains no triangles');
+  if (vertices.length / 9 > limits.maxTriangles) {
+    throw new Error(
+      `STL has too many triangles (${Math.floor(vertices.length / 9).toLocaleString()}); ` +
+        `limit is ${limits.maxTriangles.toLocaleString()}.`,
+    );
+  }
   const indices = new Uint32Array(vertices.length / 3);
   for (let i = 0; i < indices.length; i++) indices[i] = i;
   const mesh = centerMeshesOnBed([{ vertices, indices }])[0];
@@ -546,7 +648,11 @@ export function parseSTL(buffer: ArrayBuffer, fileName: string): ProjectInfo {
   };
 }
 
-export function parseProjectFile(buffer: ArrayBuffer, fileName: string): ProjectInfo {
-  if (/\.stl$/i.test(fileName)) return parseSTL(buffer, fileName);
-  return parse3MF(buffer, fileName);
+export function parseProjectFile(
+  buffer: ArrayBuffer,
+  fileName: string,
+  limits: ParseLimits = DEFAULT_LIMITS,
+): ProjectInfo {
+  if (/\.stl$/i.test(fileName)) return parseSTL(buffer, fileName, limits);
+  return parse3MF(buffer, fileName, limits);
 }
