@@ -17,12 +17,12 @@
     "fflate": "^0.8.2",
     "react": "^18.3.1",
     "react-dom": "^19.2.7",
-    "three": "^0.165.0"
+    "three": "^0.185.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
     "@types/react-dom": "^19.2.3",
-    "@types/three": "^0.165.0",
+    "@types/three": "^0.185.1",
     "@vitejs/plugin-react": "^6.0.3",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
